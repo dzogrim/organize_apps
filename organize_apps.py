@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Organize macOS installers with deterministic, review-friendly conventions.
 
-Primary mode:
-- Parse application name/version/channel from heterogeneous file/folder names.
-- Move entries into `App Name/Version/<original item>`.
+Core goals:
+- Normalize inconsistent release names into stable app/version paths.
+- Keep operations auditable (explicit MOVE lines, concise summaries).
+- Prefer idempotent behavior so repeated runs do not churn the tree.
 
-Secondary mode (`--rebucket`):
-- Re-distribute top-level entries into balanced Finder buckets
-  (e.g. `A-B__checked`, `S__checked`).
+Main modes:
+- Default organize mode: parse and move into `App/Version/<original-item>`.
+- `--rebucket`: rebalance top-level entries into fixed `*_checked` buckets.
+- `--promote-unknown`: parse and promote entries found under unknown tracks.
+- `--refine-containers`: flatten one redundant wrapper level in app containers.
+- `--audit`: read-only quality report for maintenance planning.
 
 Safety model:
-- Dry-run by default.
-- Idempotency-focused checks avoid repeated reshuffling on subsequent runs.
+- Dry-run by default (`--apply` required for writes).
+- Collision-safe moves (`(2)`, `(3)`, ...).
+- Conservative skips for already-organized containers and bucket roots.
 """
 
 from __future__ import annotations
@@ -44,6 +49,8 @@ VERSION_RE = re.compile(
     (?<![A-Za-z0-9])
     v?
     (
+      \d{8}(?:[._\-]\d{4,8})?
+      |
       \d+(?:[._\-\s]\d+){1,}
       (?:[-_.]?(?:b|beta|rc|alpha|ß)\d*)?
       |
@@ -62,6 +69,7 @@ TRAILING_TAG_RE = re.compile(
 
 @dataclass
 class ParseResult:
+    """Structured parse output used to compute deterministic destinations."""
     app_name: str
     version: str
     edition: str | None = None
@@ -116,6 +124,17 @@ BUILTIN_APP_ALIASES = {
     "wifiexplorerpro": "WiFi Explorer",
     "roxiotoasttitanium": "Toast Titanium",
     "toasttitaniumpro": "Toast Titanium",
+    "additionaltoolsforxcode": "Additional Tools for Xcode",
+    "devicesupportformacos": "Device Support for macOS",
+    "graphicstoolsforxcode": "Graphics Tools for Xcode",
+    "hardwareiotoolsforxcode": "Hardware IO Tools for Xcode",
+    "kerneldebugkit": "Kernel Debug Kit",
+    "sfsymbols": "SF Symbols",
+    "fonttoolsforxcode": "Font Tools for Xcode",
+    "elstensoftwarebliss": "Bliss",
+    "elstensoftwareblissv": "Bliss",
+    "xcode": "Xcode",
+    "xode": "Xcode",
 }
 
 REBUCKET_SCHEME: list[tuple[str, set[str]]] = [
@@ -154,7 +173,20 @@ def normalize_version(raw: str) -> str:
     """Normalize extracted version tokens to dotted format."""
     version = raw.lower().replace("ß", "b").lstrip("v")
     version = re.sub(r"[\s_-]+", ".", version)
-    return re.sub(r"\.+", ".", version).strip(".")
+    version = re.sub(r"\.+", ".", version).strip(".")
+
+    # Date-like version: YYYYMMDD(.build) -> YYYY.MM.DD(.build)
+    m = re.fullmatch(r"(?P<date>\d{8})(?:\.(?P<build>\d{4,8}))?", version)
+    if m:
+        y = int(m.group("date")[0:4])
+        mo = int(m.group("date")[4:6])
+        d = int(m.group("date")[6:8])
+        if 1970 <= y <= 2099 and 1 <= mo <= 12 and 1 <= d <= 31:
+            base = f"{y:04d}.{mo:02d}.{d:02d}"
+            build = m.group("build")
+            return f"{base}.{build}" if build else base
+
+    return version
 
 
 def normalize_edition(raw: str) -> str:
@@ -196,6 +228,18 @@ EDITION_PROTECTED_KEYS = {
 
 BUILTIN_PUBLISHER_ALIASES = {
     "roxio": "Roxio",
+}
+
+# Optional parent grouping for selected products.
+APP_PARENT_GROUPS = {
+    "xcode": "Apple Developer Tools",
+    "additionaltoolsforxcode": "Apple Developer Tools",
+    "devicesupportformacos": "Apple Developer Tools",
+    "graphicstoolsforxcode": "Apple Developer Tools",
+    "hardwareiotoolsforxcode": "Apple Developer Tools",
+    "kerneldebugkit": "Apple Developer Tools",
+    "sfsymbols": "Apple Developer Tools",
+    "fonttoolsforxcode": "Apple Developer Tools",
 }
 
 
@@ -291,6 +335,29 @@ def normalize_app_metadata(
     return app_name, edition, publisher, confidence, notes
 
 
+def apply_version_prefix_from_tail(raw_app: str, version: str) -> tuple[str, str, str | None]:
+    """Move trailing label words from app tail into version when appropriate.
+
+    Example:
+    - "Encyclopedie Universalis Edition 2014" ->
+      app="Encyclopedie Universalis", version="Edition 2014"
+    """
+    year_like = re.fullmatch(r"\d{4}(?:\.\d+)?", version) is not None
+    if not year_like:
+        return raw_app, version, None
+
+    m = re.match(r"^(?P<base>.+?)\s+(?P<label>Edition)$", raw_app, flags=re.IGNORECASE)
+    if not m:
+        return raw_app, version, None
+
+    base = normalize_spaces(m.group("base"))
+    if not base:
+        return raw_app, version, None
+
+    label = normalize_edition(m.group("label"))
+    return base, f"{label} {version}", f"version-prefix:{label}"
+
+
 def extract_channel(raw: str) -> str | None:
     """Extract release channel/group tag from bracket or tail markers."""
     channel = None
@@ -358,6 +425,9 @@ def parse_name_and_version(
         normalize_publishers=normalize_publishers,
         publishers=publishers,
     )
+    app_name, version, version_note = apply_version_prefix_from_tail(app_name, version)
+    if version_note:
+        notes.append(version_note)
     channel = extract_channel(normalized)
     if channel and publisher and app_key(channel) == app_key(publisher):
         channel = None
@@ -421,6 +491,15 @@ def safe_part(part: str) -> str:
 def app_key(name: str) -> str:
     """Canonical key for grouping variants across punctuation/case changes."""
     return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def app_path_parts(display_name: str) -> list[str]:
+    """Resolve app path parts, optionally with a parent grouping folder."""
+    key = app_key(display_name)
+    parent = APP_PARENT_GROUPS.get(key)
+    if parent:
+        return [parent, display_name]
+    return [display_name]
 
 
 def app_prettiness_score(name: str) -> tuple[int, int]:
@@ -540,7 +619,11 @@ def iter_rebucket_sources(root: Path, include_hidden: bool) -> Iterable[Path]:
 
 
 def run_rebucket(root: Path, apply: bool, include_hidden: bool, unknown_dir: str, verbose: bool) -> int:
-    """Execute rebucket mode (dry-run by default)."""
+    """Execute rebucket mode.
+
+    Rebucket mode is independent from parser-based organize mode and only
+    reassigns top-level entries to the canonical `*_checked` scheme.
+    """
     moved = 0
     skipped = 0
     destination_bucket_dirs = {f"{label}__checked" for label, _ in REBUCKET_SCHEME}
@@ -577,7 +660,9 @@ def run_rebucket(root: Path, apply: bool, include_hidden: bool, unknown_dir: str
 
 def compute_destination(root: Path, src_name: str, app_display_name: str, parsed: ParseResult) -> Path:
     """Build destination path for one parsed entry."""
-    app_part = safe_part(app_display_name)
+    app_base = root
+    for part in app_path_parts(app_display_name):
+        app_base = app_base / safe_part(part)
     version_part = safe_part(parsed.version)
     if parsed.revision:
         version_part = f"{version_part} [v{safe_part(parsed.revision)}]"
@@ -589,7 +674,7 @@ def compute_destination(root: Path, src_name: str, app_display_name: str, parsed
         version_part = f"{version_part} [{safe_part(parsed.channel)}]"
     if parsed.publisher:
         version_part = f"{version_part} [Publisher:{safe_part(parsed.publisher)}]"
-    return root / app_part / version_part / src_name
+    return app_base / version_part / src_name
 
 
 def iter_entries(root: Path, include_hidden: bool) -> Iterable[Path]:
@@ -648,7 +733,11 @@ def promote_unknown_entries(
     normalize_publishers: bool,
     publishers: dict[str, str],
 ) -> tuple[int, int]:
-    """Promote parseable entries from unknown tracks into app/version structure."""
+    """Promote parseable entries from unknown tracks into app/version structure.
+
+    This pass only inspects direct children of unknown tracks, keeping scope
+    intentionally narrow and predictable.
+    """
     promoted = 0
     checked = 0
     display_by_key: dict[str, str] = {}
@@ -684,7 +773,11 @@ def run_audit(
     normalize_publishers: bool,
     publishers: dict[str, str],
 ) -> int:
-    """Analyze tree quality and print maintenance-oriented metrics (no moves)."""
+    """Analyze tree quality and print maintenance-oriented metrics.
+
+    Audit mode never mutates the filesystem. It is intended as a preflight
+    report before running organize/promote/refine passes.
+    """
     total_dirs = 0
     total_files = 0
     unknown_dirs = 0
@@ -826,9 +919,9 @@ def refine_app_container(
 def already_grouped(root: Path, src: Path, app_display_name: str, parsed: ParseResult) -> bool:
     """Return True when entry already matches the expected app/version layout."""
     rel = src.relative_to(root)
-    if len(rel.parts) < 3:
+    app_parts = [safe_part(p) for p in app_path_parts(app_display_name)]
+    if len(rel.parts) < len(app_parts) + 2:
         return False
-    app = safe_part(app_display_name)
     version = safe_part(parsed.version)
     if parsed.revision:
         version = f"{version} [v{safe_part(parsed.revision)}]"
@@ -838,8 +931,11 @@ def already_grouped(root: Path, src: Path, app_display_name: str, parsed: ParseR
         version = f"{version} [Update]"
     if parsed.publisher:
         version = f"{version} [Publisher:{safe_part(parsed.publisher)}]"
-    current_app, current_version = rel.parts[0], rel.parts[1]
-    return app_key(current_app) == app_key(app) and current_version.startswith(version)
+    for idx, app_part in enumerate(app_parts):
+        if app_key(rel.parts[idx]) != app_key(app_part):
+            return False
+    current_version = rel.parts[len(app_parts)]
+    return current_version.startswith(version)
 
 
 def ensure_unique_destination(dest: Path) -> Path:
@@ -886,25 +982,29 @@ def move_entry(src: Path, dest: Path, apply: bool) -> None:
 
 
 def main() -> int:
-    """CLI entrypoint."""
+    """CLI entrypoint.
+
+    The script defaults to dry-run across all mutating modes; use `--apply`
+    only after reviewing planned operations.
+    """
     parser = argparse.ArgumentParser(
         description="Organize installers into AppName/Version/<original-file-or-folder>.",
         epilog="Default behavior is dry-run. Use --apply to perform real moves.",
     )
     parser.add_argument("root", nargs="?", default=".", help="Directory to organize (default: current directory)")
-    parser.add_argument("--apply", action="store_true", help="Actually move entries (default is dry-run)")
-    parser.add_argument("--verbose", action="store_true", help="Show SKIP lines and extra diagnostics")
+    parser.add_argument("--apply", action="store_true", help="Apply filesystem moves (otherwise dry-run)")
+    parser.add_argument("--verbose", action="store_true", help="Show SKIP diagnostics and extra context")
     parser.add_argument("--include-hidden", action="store_true", help="Include hidden files and folders")
     parser.add_argument(
         "--rebucket",
         action="store_true",
-        help="Re-distribute entries into balanced top-level buckets (A-B__checked, C-D__checked, ...)",
+        help="Re-distribute entries into canonical top-level buckets (A-B__checked, C-D__checked, ...)",
     )
     parser.add_argument("--unknown-dir", default="_Unsorted", help="Folder for entries where version parsing fails")
     parser.add_argument(
         "--no-version-label",
         default="unknown",
-        help="Version label for app names without parsable version (set empty to keep them in unknown-dir)",
+        help="Version label for names without parsable version (set empty to keep them in unknown-dir)",
     )
     parser.add_argument(
         "--aliases-file",
@@ -929,7 +1029,7 @@ def main() -> int:
     parser.add_argument(
         "--refine-containers",
         action="store_true",
-        help="Inspect already-organized app containers and flatten one redundant wrapper level safely",
+        help="Flatten one redundant wrapper level inside already-organized app containers",
     )
     parser.add_argument(
         "--promote-unknown",
@@ -939,7 +1039,7 @@ def main() -> int:
     parser.add_argument(
         "--audit",
         action="store_true",
-        help="Analyze folder quality (unknown/wrappers/sidecars/empty dirs) and print a maintenance report",
+        help="Read-only quality report (unknown tracks, wrappers, sidecars, empty dirs)",
     )
 
     args = parser.parse_args()
@@ -985,6 +1085,13 @@ def main() -> int:
         if src.name == args.unknown_dir:
             if args.verbose:
                 print(f"SKIP: special folder {src}")
+            skipped += 1
+            continue
+        # Safety: when running from a bucketed root, never treat bucket folders
+        # themselves as app entries.
+        if src.parent == root and src.is_dir() and REBUCKET_DIR_RE.match(src.name):
+            if args.verbose:
+                print(f"SKIP: rebucket container {src}")
             skipped += 1
             continue
         if looks_like_app_container(src):

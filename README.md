@@ -3,16 +3,26 @@
 Script:
 `organize_apps.py`
 
-This tool has two modes:
-
-1. Organize installers into `App Name/Version/<original file or folder>`.
-2. Rebucket entries into balanced Finder buckets (`A-B__checked`, `S__checked`, ...).
+This tool provides parser-driven sorting and maintenance passes for large installer archives.
 
 Default behavior is always `dry-run`.
 
+## Modes At A Glance
+
+- Default organize mode:
+  - Parse each top-level entry and move it to `App/Version/<original-item>`.
+- `--rebucket`:
+  - Rebalance top-level entries into fixed bucket folders (`A-B__checked`, ...).
+- `--promote-unknown`:
+  - Re-parse children under `unknown` tracks in already-organized app containers.
+- `--refine-containers`:
+  - Flatten one redundant wrapper level like `App/1.2/App 1.2/<payload>`.
+- `--audit`:
+  - Read-only scan with maintenance metrics and sample problematic paths.
+
 ## Quickstart
 
-Preview organize mode:
+Preview organize mode (safe dry-run):
 
 ```bash
 python3 ./organize_apps.py "/path/to/installers"
@@ -51,6 +61,10 @@ python3 ./organize_apps.py "/path/to/root" --rebucket --apply
 - `--refine-containers`: inspect already organized app folders and flatten one redundant nested wrapper level
 - `--promote-unknown`: promote parseable entries found under `unknown/` tracks in already grouped app containers
 - `--audit`: generate a non-destructive maintenance report (unknown dirs, wrapper candidates, sidecars, empty dirs)
+
+Tip:
+- `SKIP:` lines are intentionally hidden by default to keep dry-run output focused on planned changes.
+- Use `--verbose` when debugging why an entry was ignored.
 
 ## Refine Containers Mode
 
@@ -97,7 +111,25 @@ Example:
 python3 ./organize_apps.py "/path/to/root" --audit
 ```
 
-Recommended usage:
+## Recommended Maintenance Workflow
+
+1. Baseline quality report:
+
+```bash
+python3 ./organize_apps.py "/path/to/root" --audit
+```
+
+2. Promote parseable entries from unknown tracks:
+
+```bash
+python3 ./organize_apps.py "/path/to/root" \
+  --promote-unknown \
+  --normalize-editions \
+  --normalize-publishers \
+  --publishers-file ./publishers.json
+```
+
+3. Flatten redundant wrappers:
 
 ```bash
 python3 ./organize_apps.py "/path/to/root" \
@@ -107,7 +139,7 @@ python3 ./organize_apps.py "/path/to/root" \
   --publishers-file ./publishers.json
 ```
 
-Then apply:
+4. Apply after review (same command + `--apply`):
 
 ```bash
 python3 ./organize_apps.py "/path/to/root" \
@@ -143,6 +175,7 @@ Summary line includes:
 ## Idempotency Guarantees
 
 - Organize mode skips already organized app containers.
+- Organize mode skips top-level rebucket containers (`*_checked`) to avoid reinterpreting bucket roots as app names.
 - With `--refine-containers`, app containers are inspected but only a safe one-level flatten is attempted.
 - Organize mode skips special unknown folder (`_Unsorted` by default).
 - Rebucket mode skips entries already in their target bucket.
@@ -161,6 +194,13 @@ Summary line includes:
   - `Upd`, `Updt`, `Update` -> `[Update]`
 - Revision marker after version is preserved:
   - `2016.10 v2` -> `2016.10 [v2]`
+- Date-like versions are normalized:
+  - `Bliss 20230117` -> version `2023.01.17`
+  - `Bliss 20230117.123456` -> version `2023.01.17.123456`
+- Tail labels can be promoted into version:
+  - `Encyclopedie Universalis Edition 2014` -> `Encyclopedie Universalis/Edition 2014/...`
+- Build-only versions are supported:
+  - `Path Finder 2121` -> version `2121`
 - Channel/release tags are preserved in version folder:
   - e.g. `[TNT]`, `[atb]`, `[HCISO]`
 
@@ -195,4 +235,4 @@ Example `publishers.json`:
 3. Apply organize mode.
 4. Run rebucket mode in dry-run.
 5. Apply rebucket mode.
-6. Re-run both modes to confirm `moved=0`.
+6. Re-run `--audit` and confirm key counts are trending down (`unknown_dirs`, `parseable_in_unknown`, `wrapper_candidates`).
