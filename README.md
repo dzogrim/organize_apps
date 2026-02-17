@@ -46,6 +46,33 @@ Apply rebucket mode:
 python3 ./organize_apps.py "/path/to/root" --rebucket --apply
 ```
 
+## TUI Launcher (Dialog)
+
+Wrapper script:
+- `organize_apps_tui.sh`
+
+Requirements:
+- `dialog`
+- `python3`
+
+Run:
+
+```bash
+cd ~/workspaces/organize_apps
+./organize_apps_tui.sh
+```
+
+What it provides:
+- Interactive mode selection (`organize`, `rebucket`, `audit`, `promote-unknown`, `refine-containers`, `maintain`).
+- Toggle all boolean options from a checklist.
+- Edit value options (`--unknown-dir`, `--no-version-label`, `--aliases-file`, `--publishers-file`).
+- Directory picker (`dialog --dselect`) to choose the current target subdirectory.
+- Confirmation dialog showing the full command before execution.
+
+Notes:
+- Dry-run remains default unless `apply` is enabled in the launcher.
+- `SKIP:` lines remain hidden unless `verbose` is enabled.
+
 ## CLI Options
 
 - `--apply`: perform moves (without this flag, only planned moves are printed)
