@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -63,9 +65,12 @@ class ParseResult:
     app_name: str
     version: str
     edition: str | None = None
+    publisher: str | None = None
     revision: str | None = None
     is_update: bool = False
     channel: str | None = None
+    normalization_confidence: str | None = None
+    normalization_notes: list[str] | None = None
 
 
 BUILTIN_APP_ALIASES = {
@@ -109,6 +114,8 @@ BUILTIN_APP_ALIASES = {
     "dnscryptosx": "DNSCrypt OS X",
     "plisteditpro": "PlistEdit",
     "wifiexplorerpro": "WiFi Explorer",
+    "roxiotoasttitanium": "Toast Titanium",
+    "toasttitaniumpro": "Toast Titanium",
 }
 
 REBUCKET_SCHEME: list[tuple[str, set[str]]] = [
@@ -126,6 +133,8 @@ REBUCKET_SCHEME: list[tuple[str, set[str]]] = [
 ]
 
 REBUCKET_DIR_RE = re.compile(r"^(?:0-9|[A-Z](?:-[A-Z])?)__checked$")
+VERSIONISH_DIR_RE = re.compile(r"^(?:\d+(?:[.\s]\d+)+|\d{4})\s*$")
+SIDECAR_RE = re.compile(r"(?i)(keygen|crack|serial|license|\.nfo$|\.rtf$|\bkg\b|\bsn\b)")
 
 
 def normalize_spaces(value: str) -> str:
@@ -156,6 +165,39 @@ def normalize_edition(raw: str) -> str:
 
 UPDATE_MARKER_RE = re.compile(r"\b(?:upd|updt|update|updates)\b", re.IGNORECASE)
 
+EDITION_TOKENS: tuple[tuple[str, ...], ...] = (
+    ("plus", "pro"),
+    ("business", "edition"),
+    ("ultimate", "edition"),
+    ("professional",),
+    ("enterprise",),
+    ("business",),
+    ("corporate",),
+    ("premium",),
+    ("ultimate",),
+    ("community",),
+    ("standard",),
+    ("express",),
+    ("lite",),
+    ("suite",),
+    ("plus",),
+    ("pro",),
+    ("x",),
+)
+
+# Cases where suffix-like tokens are part of the product name itself.
+EDITION_PROTECTED_KEYS = {
+    "tableplus",
+    "photoplus",
+    "sqlpro",
+    "gpgsuite",
+    "murusprosuite",
+}
+
+BUILTIN_PUBLISHER_ALIASES = {
+    "roxio": "Roxio",
+}
+
 
 def detect_update_marker(raw_tail: str) -> bool:
     """Detect update markers only in text after version token."""
@@ -164,21 +206,89 @@ def detect_update_marker(raw_tail: str) -> bool:
     return UPDATE_MARKER_RE.search(raw_tail) is not None
 
 
-def split_app_edition(raw_app: str) -> tuple[str, str | None]:
-    """Split trailing edition suffix (`Pro`, `Plus Pro`, `X`) from app name."""
-    patterns = [
-        r"^(?P<base>.+?)\s+(?P<ed>Plus Pro)$",
-        r"^(?P<base>.+?)\s+(?P<ed>Pro)$",
-        r"^(?P<base>.+?)\s+(?P<ed>X)$",
-    ]
-    for pat in patterns:
-        m = re.match(pat, raw_app, flags=re.IGNORECASE)
-        if m:
-            base = normalize_spaces(m.group("base"))
-            edition = normalize_edition(m.group("ed"))
-            if base:
-                return base, edition
-    return raw_app, None
+def split_app_edition(raw_app: str, enabled: bool) -> tuple[str, str | None, str | None, str | None]:
+    """Split known trailing edition suffixes from app name when enabled."""
+    if not enabled:
+        return raw_app, None, None, None
+
+    words = [w for w in re.split(r"\s+", raw_app.strip()) if w]
+    if len(words) < 2:
+        return raw_app, None, None, None
+
+    key = app_key(raw_app)
+    if key in EDITION_PROTECTED_KEYS:
+        return raw_app, None, None, None
+
+    lowered = [w.lower() for w in words]
+    for token_seq in EDITION_TOKENS:
+        n = len(token_seq)
+        if n >= len(words):
+            continue
+        if tuple(lowered[-n:]) != token_seq:
+            continue
+        base = normalize_spaces(" ".join(words[:-n]))
+        edition = normalize_edition(" ".join(words[-n:]))
+        if not base:
+            continue
+        confidence = "high" if n > 1 else "medium"
+        note = f"edition:{edition}"
+        return base, edition, confidence, note
+
+    return raw_app, None, None, None
+
+
+def split_publisher(raw_app: str, enabled: bool, publishers: dict[str, str]) -> tuple[str, str | None, str | None, str | None]:
+    """Extract publisher from name prefix/suffix when enabled."""
+    if not enabled:
+        return raw_app, None, None, None
+
+    paren = re.match(r"^(?P<base>.+?)\s*[\(\[](?P<pub>[A-Za-z][A-Za-z0-9&.+ '\-]{1,40})[\)\]]$", raw_app)
+    if paren:
+        base = normalize_spaces(paren.group("base"))
+        pub_raw = normalize_spaces(paren.group("pub"))
+        pub_key = app_key(pub_raw)
+        publisher = publishers.get(pub_key, pub_raw)
+        if base and publisher:
+            return base, publisher, "high", f"publisher:{publisher}"
+
+    lowered = raw_app.lower()
+    for _pub_key, publisher in sorted(publishers.items(), key=lambda kv: len(kv[1]), reverse=True):
+        pub_lower = publisher.lower()
+        if not lowered.startswith(pub_lower + " "):
+            continue
+        base = normalize_spaces(raw_app[len(publisher) :])
+        if base and len(base.split()) >= 1:
+            return base, publisher, "medium", f"publisher:{publisher}"
+
+    return raw_app, None, None, None
+
+
+def normalize_app_metadata(
+    raw_app: str,
+    normalize_editions: bool,
+    normalize_publishers: bool,
+    publishers: dict[str, str],
+) -> tuple[str, str | None, str | None, str | None, list[str]]:
+    """Normalize app name and return metadata + confidence + notes."""
+    notes: list[str] = []
+    confidence_rank = {"low": 1, "medium": 2, "high": 3}
+    confidence: str | None = None
+
+    app_name, edition, ed_conf, ed_note = split_app_edition(raw_app, enabled=normalize_editions)
+    if ed_note:
+        notes.append(ed_note)
+    if ed_conf:
+        confidence = ed_conf
+
+    app_name, publisher, pub_conf, pub_note = split_publisher(
+        app_name, enabled=normalize_publishers, publishers=publishers
+    )
+    if pub_note:
+        notes.append(pub_note)
+    if pub_conf and (confidence is None or confidence_rank[pub_conf] > confidence_rank[confidence]):
+        confidence = pub_conf
+
+    return app_name, edition, publisher, confidence, notes
 
 
 def extract_channel(raw: str) -> str | None:
@@ -199,7 +309,12 @@ def extract_channel(raw: str) -> str | None:
     return channel or None
 
 
-def parse_name_and_version(entry_name: str) -> ParseResult | None:
+def parse_name_and_version(
+    entry_name: str,
+    normalize_editions: bool,
+    normalize_publishers: bool,
+    publishers: dict[str, str],
+) -> ParseResult | None:
     """Parse name/version metadata from one filesystem entry name.
 
     Returns:
@@ -237,21 +352,36 @@ def parse_name_and_version(entry_name: str) -> ParseResult | None:
     if not raw_app:
         return None
 
-    app_name, edition = split_app_edition(raw_app)
+    app_name, edition, publisher, confidence, notes = normalize_app_metadata(
+        raw_app,
+        normalize_editions=normalize_editions,
+        normalize_publishers=normalize_publishers,
+        publishers=publishers,
+    )
     channel = extract_channel(normalized)
+    if channel and publisher and app_key(channel) == app_key(publisher):
+        channel = None
     is_update = detect_update_marker(raw_tail)
 
     return ParseResult(
         app_name=app_name,
         version=version,
         edition=edition,
+        publisher=publisher,
         revision=revision,
         is_update=is_update,
         channel=channel,
+        normalization_confidence=confidence,
+        normalization_notes=notes or None,
     )
 
 
-def parse_app_name_only(entry_name: str) -> str | None:
+def parse_app_name_only(
+    entry_name: str,
+    normalize_editions: bool,
+    normalize_publishers: bool,
+    publishers: dict[str, str],
+) -> ParseResult | None:
     """Best-effort extraction of app name for entries without version."""
     base = entry_name
     suffix = Path(base).suffix.lower()
@@ -265,7 +395,20 @@ def parse_app_name_only(entry_name: str) -> str | None:
         return None
     if not re.search(r"[A-Za-z]", cleaned):
         return None
-    return cleaned
+    app_name, edition, publisher, confidence, notes = normalize_app_metadata(
+        cleaned,
+        normalize_editions=normalize_editions,
+        normalize_publishers=normalize_publishers,
+        publishers=publishers,
+    )
+    return ParseResult(
+        app_name=app_name,
+        version="",
+        edition=edition,
+        publisher=publisher,
+        normalization_confidence=confidence,
+        normalization_notes=notes or None,
+    )
 
 
 def safe_part(part: str) -> str:
@@ -294,6 +437,46 @@ def choose_display_name(current: str | None, candidate: str, key: str, aliases: 
     if current is None:
         return candidate
     return candidate if app_prettiness_score(candidate) > app_prettiness_score(current) else current
+
+
+def load_publishers(path: Path | None) -> dict[str, str]:
+    """Load publisher aliases from JSON and merge with built-in publishers."""
+    publishers: dict[str, str] = dict(BUILTIN_PUBLISHER_ALIASES)
+    if path is None:
+        return publishers
+
+    if not path.exists():
+        print(f"WARN: publishers file not found: {path} (using built-in publishers only)")
+        return publishers
+
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception as exc:
+        print(f"WARN: failed to read publishers file {path}: {exc} (using built-in publishers only)")
+        return publishers
+
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, str):
+                continue
+            key = app_key(entry)
+            if key:
+                publishers[key] = normalize_spaces(entry)
+        return publishers
+
+    if not isinstance(raw, dict):
+        print(f"WARN: publishers file {path} must be a JSON array or object; ignoring it")
+        return publishers
+
+    for src, dst in raw.items():
+        if not isinstance(src, str) or not isinstance(dst, str):
+            continue
+        src_key = app_key(src)
+        dst_name = normalize_spaces(dst)
+        if src_key and dst_name:
+            publishers[src_key] = dst_name
+    return publishers
 
 
 def load_aliases(path: Path | None) -> dict[str, str]:
@@ -356,7 +539,7 @@ def iter_rebucket_sources(root: Path, include_hidden: bool) -> Iterable[Path]:
         yield item
 
 
-def run_rebucket(root: Path, apply: bool, include_hidden: bool, unknown_dir: str) -> int:
+def run_rebucket(root: Path, apply: bool, include_hidden: bool, unknown_dir: str, verbose: bool) -> int:
     """Execute rebucket mode (dry-run by default)."""
     moved = 0
     skipped = 0
@@ -364,20 +547,23 @@ def run_rebucket(root: Path, apply: bool, include_hidden: bool, unknown_dir: str
 
     for src in iter_rebucket_sources(root, include_hidden=include_hidden):
         if src.name == unknown_dir:
-            print(f"SKIP: special folder {src}")
+            if verbose:
+                print(f"SKIP: special folder {src}")
             skipped += 1
             continue
 
         # Keep canonical destination buckets at root in place.
         if src.parent == root and src.is_dir() and src.name in destination_bucket_dirs:
-            print(f"SKIP: rebucket destination {src}")
+            if verbose:
+                print(f"SKIP: rebucket destination {src}")
             skipped += 1
             continue
 
         label = rebucket_label_for(src.name)
         target_dir = root / f"{label}__checked"
         if src.parent == target_dir:
-            print(f"SKIP: already rebucketed {src}")
+            if verbose:
+                print(f"SKIP: already rebucketed {src}")
             skipped += 1
             continue
 
@@ -401,6 +587,8 @@ def compute_destination(root: Path, src_name: str, app_display_name: str, parsed
         version_part = f"{version_part} [Update]"
     if parsed.channel:
         version_part = f"{version_part} [{safe_part(parsed.channel)}]"
+    if parsed.publisher:
+        version_part = f"{version_part} [Publisher:{safe_part(parsed.publisher)}]"
     return root / app_part / version_part / src_name
 
 
@@ -412,6 +600,11 @@ def iter_entries(root: Path, include_hidden: bool) -> Iterable[Path]:
         if item.name == Path(__file__).name:
             continue
         yield item
+
+
+def visible_children(path: Path) -> list[Path]:
+    """Return non-hidden direct children."""
+    return [c for c in path.iterdir() if not c.name.startswith(".")]
 
 
 VERSION_DIR_RE = re.compile(r"^(?:unknown|\d+(?:\.\d+)*(?:\s+\[[^\]]+\])*)$", re.IGNORECASE)
@@ -429,6 +622,207 @@ def looks_like_app_container(path: Path) -> bool:
     return any(c.is_dir() and VERSION_DIR_RE.match(c.name) for c in children)
 
 
+def looks_like_version_dir(path: Path) -> bool:
+    """Broader version-like matcher used for container refinement."""
+    if not path.is_dir():
+        return False
+    return VERSION_DIR_RE.match(path.name) is not None or VERSIONISH_DIR_RE.match(path.name) is not None
+
+
+def iter_unknown_tracks(app_dir: Path, unknown_dir: str) -> Iterable[Path]:
+    """Yield unknown tracks for one app container (legacy and configured name)."""
+    names = {unknown_dir.lower(), "unknown"}
+    for child in sorted(app_dir.iterdir(), key=lambda p: p.name.lower()):
+        if child.name.startswith(".") or not child.is_dir():
+            continue
+        if child.name.lower() in names:
+            yield child
+
+
+def promote_unknown_entries(
+    app_dir: Path,
+    apply: bool,
+    unknown_dir: str,
+    aliases: dict[str, str],
+    normalize_editions: bool,
+    normalize_publishers: bool,
+    publishers: dict[str, str],
+) -> tuple[int, int]:
+    """Promote parseable entries from unknown tracks into app/version structure."""
+    promoted = 0
+    checked = 0
+    display_by_key: dict[str, str] = {}
+
+    for track_dir in iter_unknown_tracks(app_dir, unknown_dir=unknown_dir):
+        for child in sorted(track_dir.iterdir(), key=lambda p: p.name.lower()):
+            if child.name.startswith("."):
+                continue
+            parsed = parse_name_and_version(
+                child.name,
+                normalize_editions=normalize_editions,
+                normalize_publishers=normalize_publishers,
+                publishers=publishers,
+            )
+            if parsed is None:
+                continue
+            checked += 1
+            key = app_key(parsed.app_name)
+            display_by_key[key] = choose_display_name(display_by_key.get(key), parsed.app_name, key, aliases)
+            app_display_name = display_by_key[key]
+            destination = compute_destination(track_dir, child.name, app_display_name, parsed)
+            move_entry(child, destination, apply)
+            promoted += 1
+
+    return promoted, checked
+
+
+def run_audit(
+    root: Path,
+    include_hidden: bool,
+    unknown_dir: str,
+    normalize_editions: bool,
+    normalize_publishers: bool,
+    publishers: dict[str, str],
+) -> int:
+    """Analyze tree quality and print maintenance-oriented metrics (no moves)."""
+    total_dirs = 0
+    total_files = 0
+    unknown_dirs = 0
+    empty_dirs = 0
+    wrapper_candidates = 0
+    sidecars = 0
+    parseable_in_unknown = 0
+    unknown_samples: list[str] = []
+    wrapper_samples: list[str] = []
+    sidecar_samples: list[str] = []
+    parseable_unknown_samples: list[str] = []
+    depth_counter: Counter[int] = Counter()
+    unknown_names = {unknown_dir.lower(), "unknown"}
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirpath_p = Path(dirpath)
+        if not include_hidden:
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            filenames = [f for f in filenames if not f.startswith(".")]
+
+        total_dirs += 1
+        total_files += len(filenames)
+        rel = dirpath_p.relative_to(root) if dirpath_p != root else Path(".")
+        depth_counter[len(rel.parts)] += 1
+
+        current_name = dirpath_p.name.lower()
+        if current_name in unknown_names:
+            unknown_dirs += 1
+            if len(unknown_samples) < 8:
+                unknown_samples.append(str(dirpath_p))
+            for child_name in sorted(dirnames + filenames, key=str.lower):
+                parsed = parse_name_and_version(
+                    child_name,
+                    normalize_editions=normalize_editions,
+                    normalize_publishers=normalize_publishers,
+                    publishers=publishers,
+                )
+                if parsed is None:
+                    continue
+                parseable_in_unknown += 1
+                if len(parseable_unknown_samples) < 8:
+                    parseable_unknown_samples.append(str(dirpath_p / child_name))
+
+        if not dirnames and not filenames:
+            empty_dirs += 1
+
+        for fname in filenames:
+            if SIDECAR_RE.search(fname):
+                sidecars += 1
+                if len(sidecar_samples) < 8:
+                    sidecar_samples.append(str(dirpath_p / fname))
+
+        if looks_like_version_dir(dirpath_p) and len(dirnames) == 1 and not filenames:
+            child = dirnames[0]
+            if re.search(r"\d", child):
+                wrapper_candidates += 1
+                if len(wrapper_samples) < 8:
+                    wrapper_samples.append(str(dirpath_p / child))
+
+    print(
+        f"\nSummary (AUDIT): dirs={total_dirs}, files={total_files}, "
+        f"unknown_dirs={unknown_dirs}, parseable_in_unknown={parseable_in_unknown}, "
+        f"wrapper_candidates={wrapper_candidates}, sidecars={sidecars}, empty_dirs={empty_dirs}, root={root}"
+    )
+    if depth_counter:
+        top_depths = ", ".join(f"d{d}:{c}" for d, c in sorted(depth_counter.items())[:8])
+        print(f"Depth histogram: {top_depths}")
+    if unknown_samples:
+        print("Sample unknown dirs:")
+        for sample in unknown_samples:
+            print(f"  - {sample}")
+    if parseable_unknown_samples:
+        print("Sample parseable entries in unknown:")
+        for sample in parseable_unknown_samples:
+            print(f"  - {sample}")
+    if wrapper_samples:
+        print("Sample wrapper candidates:")
+        for sample in wrapper_samples:
+            print(f"  - {sample}")
+    if sidecar_samples:
+        print("Sample sidecar files:")
+        for sample in sidecar_samples:
+            print(f"  - {sample}")
+
+    return 0
+
+
+def refine_app_container(
+    app_dir: Path,
+    apply: bool,
+) -> tuple[int, int]:
+    """Flatten one redundant nesting level inside an already-organized app container.
+
+    Example:
+    App/2019/2019.16.32/App 2019 16.32/<payload>
+    -> App/2019/2019.16.32/<payload>
+    """
+    fixed = 0
+    checked = 0
+    app_k = app_key(app_dir.name)
+
+    for track_dir in sorted(app_dir.iterdir(), key=lambda p: p.name.lower()):
+        if track_dir.name.startswith(".") or not track_dir.is_dir():
+            continue
+
+        for version_dir in sorted(track_dir.iterdir(), key=lambda p: p.name.lower()):
+            if version_dir.name.startswith(".") or not looks_like_version_dir(version_dir):
+                continue
+            checked += 1
+
+            direct_visible = visible_children(version_dir)
+            direct_non_dirs = [c for c in direct_visible if not c.is_dir()]
+            if direct_non_dirs:
+                continue
+
+            direct_dirs = [c for c in direct_visible if c.is_dir()]
+            if len(direct_dirs) != 1:
+                continue
+            wrapper = direct_dirs[0]
+
+            wrapper_k = app_key(wrapper.name)
+            if app_k and app_k not in wrapper_k:
+                continue
+            if not re.search(r"\d", wrapper.name):
+                continue
+
+            wrapper_children = visible_children(wrapper)
+            if not wrapper_children:
+                continue
+
+            print(f"REFINE: flatten wrapper {wrapper} -> {version_dir}")
+            for child in wrapper_children:
+                move_entry(child, version_dir / child.name, apply)
+            fixed += 1
+
+    return fixed, checked
+
+
 def already_grouped(root: Path, src: Path, app_display_name: str, parsed: ParseResult) -> bool:
     """Return True when entry already matches the expected app/version layout."""
     rel = src.relative_to(root)
@@ -442,6 +836,8 @@ def already_grouped(root: Path, src: Path, app_display_name: str, parsed: ParseR
         version = f"{version} [{safe_part(parsed.edition)}]"
     if parsed.is_update:
         version = f"{version} [Update]"
+    if parsed.publisher:
+        version = f"{version} [Publisher:{safe_part(parsed.publisher)}]"
     current_app, current_version = rel.parts[0], rel.parts[1]
     return app_key(current_app) == app_key(app) and current_version.startswith(version)
 
@@ -497,6 +893,7 @@ def main() -> int:
     )
     parser.add_argument("root", nargs="?", default=".", help="Directory to organize (default: current directory)")
     parser.add_argument("--apply", action="store_true", help="Actually move entries (default is dry-run)")
+    parser.add_argument("--verbose", action="store_true", help="Show SKIP lines and extra diagnostics")
     parser.add_argument("--include-hidden", action="store_true", help="Include hidden files and folders")
     parser.add_argument(
         "--rebucket",
@@ -514,6 +911,36 @@ def main() -> int:
         default=None,
         help="Path to JSON alias map, e.g. {'LittleSnitch': 'Little Snitch'}",
     )
+    parser.add_argument(
+        "--normalize-editions",
+        action="store_true",
+        help="Split common edition suffixes (Enterprise, Plus, Professional...) into version tags",
+    )
+    parser.add_argument(
+        "--normalize-publishers",
+        action="store_true",
+        help="Extract publisher prefixes/suffixes (e.g. Roxio Toast -> Toast [Publisher:Roxio])",
+    )
+    parser.add_argument(
+        "--publishers-file",
+        default=None,
+        help="Path to JSON publisher aliases (array or object) used by --normalize-publishers",
+    )
+    parser.add_argument(
+        "--refine-containers",
+        action="store_true",
+        help="Inspect already-organized app containers and flatten one redundant wrapper level safely",
+    )
+    parser.add_argument(
+        "--promote-unknown",
+        action="store_true",
+        help="Promote parseable entries from unknown tracks inside already grouped app containers",
+    )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Analyze folder quality (unknown/wrappers/sidecars/empty dirs) and print a maintenance report",
+    )
 
     args = parser.parse_args()
     root = Path(args.root).expanduser().resolve()
@@ -528,32 +955,85 @@ def main() -> int:
             apply=args.apply,
             include_hidden=args.include_hidden,
             unknown_dir=args.unknown_dir,
+            verbose=args.verbose,
         )
 
     aliases = load_aliases(Path(args.aliases_file).expanduser() if args.aliases_file else None)
+    publishers = load_publishers(Path(args.publishers_file).expanduser() if args.publishers_file else None)
+
+    if args.audit:
+        return run_audit(
+            root=root,
+            include_hidden=args.include_hidden,
+            unknown_dir=args.unknown_dir,
+            normalize_editions=args.normalize_editions,
+            normalize_publishers=args.normalize_publishers,
+            publishers=publishers,
+        )
     display_by_key: dict[str, str] = {}
 
     moved = 0
     skipped = 0
     unsorted = 0
     no_version = 0
+    promoted_unknown = 0
+    promoted_unknown_checked = 0
+    refined = 0
+    refined_checked = 0
 
     for src in iter_entries(root, include_hidden=args.include_hidden):
         if src.name == args.unknown_dir:
-            print(f"SKIP: special folder {src}")
+            if args.verbose:
+                print(f"SKIP: special folder {src}")
             skipped += 1
             continue
         if looks_like_app_container(src):
-            print(f"SKIP: app container {src}")
+            if args.promote_unknown:
+                promoted, promoted_checked = promote_unknown_entries(
+                    src,
+                    args.apply,
+                    unknown_dir=args.unknown_dir,
+                    aliases=aliases,
+                    normalize_editions=args.normalize_editions,
+                    normalize_publishers=args.normalize_publishers,
+                    publishers=publishers,
+                )
+                promoted_unknown += promoted
+                promoted_unknown_checked += promoted_checked
+            if args.refine_containers:
+                fixed, checked = refine_app_container(
+                    src,
+                    args.apply,
+                )
+                refined += fixed
+                refined_checked += checked
+                if fixed == 0 and args.verbose:
+                    print(f"SKIP: app container {src} (no refinements)")
+                continue
+            if args.promote_unknown:
+                continue
+            if args.verbose:
+                print(f"SKIP: app container {src}")
             skipped += 1
             continue
 
-        parsed = parse_name_and_version(src.name)
+        parsed = parse_name_and_version(
+            src.name,
+            normalize_editions=args.normalize_editions,
+            normalize_publishers=args.normalize_publishers,
+            publishers=publishers,
+        )
 
         if parsed is None:
-            app_only = parse_app_name_only(src.name)
+            app_only = parse_app_name_only(
+                src.name,
+                normalize_editions=args.normalize_editions,
+                normalize_publishers=args.normalize_publishers,
+                publishers=publishers,
+            )
             if app_only and args.no_version_label:
-                parsed = ParseResult(app_name=app_only, version=args.no_version_label)
+                parsed = app_only
+                parsed.version = args.no_version_label
                 no_version += 1
             else:
                 destination = root / args.unknown_dir / src.name
@@ -562,12 +1042,21 @@ def main() -> int:
                 moved += 1
                 continue
 
+        if parsed.normalization_notes:
+            confidence = parsed.normalization_confidence or "low"
+            notes = ", ".join(parsed.normalization_notes)
+            print(
+                f"NORMALIZE[{confidence.upper()}]: '{src.name}' -> app='{parsed.app_name}'"
+                f" edition='{parsed.edition or '-'}' publisher='{parsed.publisher or '-'}' ({notes})"
+            )
+
         key = app_key(parsed.app_name)
         display_by_key[key] = choose_display_name(display_by_key.get(key), parsed.app_name, key, aliases)
         app_display_name = display_by_key[key]
 
         if already_grouped(root, src, app_display_name, parsed):
-            print(f"SKIP: already grouped {src}")
+            if args.verbose:
+                print(f"SKIP: already grouped {src}")
             skipped += 1
             continue
 
@@ -578,7 +1067,9 @@ def main() -> int:
     mode = "APPLY" if args.apply else "DRY-RUN"
     print(
         f"\nSummary ({mode}): moved={moved}, skipped={skipped}, "
-        f"unsorted={unsorted}, no_version={no_version}, root={root}"
+        f"unsorted={unsorted}, no_version={no_version}, "
+        f"promoted_unknown={promoted_unknown}/{promoted_unknown_checked}, "
+        f"refined={refined}/{refined_checked}, root={root}"
     )
     return 0
 
