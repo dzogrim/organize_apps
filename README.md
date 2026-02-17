@@ -228,6 +228,11 @@ Summary line includes:
   - `Encyclopedie Universalis Edition 2014` -> `Encyclopedie Universalis/Edition 2014/...`
 - Build-only versions are supported:
   - `Path Finder 2121` -> version `2121`
+- Java-specific handling:
+  - `Java JDK`, `Java SE Development Kit`, `JDK ...` -> `Java/JDK - Java Development Kit/...`
+  - `Java JRE`, `Java Runtime Environment`, `Java SE Runtime Env ...`, `jre ...` -> `Java/JRE - Java Runtime Environment/...`
+  - `Java 8u40`-style versions are treated as JRE.
+  - `Java 9`, `Java 22.0.1`-style numeric versions are treated as JDK.
 - Channel/release tags are preserved in version folder:
   - e.g. `[TNT]`, `[atb]`, `[HCISO]`
 

@@ -49,6 +49,8 @@ VERSION_RE = re.compile(
     (?<![A-Za-z0-9])
     v?
     (
+      \d{1,3}u\d{1,4}(?:[._\-]\d+)?
+      |
       \d{8}(?:[._\-]\d{4,8})?
       |
       \d+(?:[._\-\s]\d+){1,}
@@ -135,6 +137,15 @@ BUILTIN_APP_ALIASES = {
     "elstensoftwareblissv": "Bliss",
     "xcode": "Xcode",
     "xode": "Xcode",
+    "jdk": "JDK - Java Development Kit",
+    "javajdk": "JDK - Java Development Kit",
+    "javadevelopmentkit": "JDK - Java Development Kit",
+    "javasedevelopmentkit": "JDK - Java Development Kit",
+    "jre": "JRE - Java Runtime Environment",
+    "javajre": "JRE - Java Runtime Environment",
+    "javaruntimeenvironment": "JRE - Java Runtime Environment",
+    "javaseruntimeenvironment": "JRE - Java Runtime Environment",
+    "javaseruntimeenv": "JRE - Java Runtime Environment",
 }
 
 REBUCKET_SCHEME: list[tuple[str, set[str]]] = [
@@ -240,6 +251,8 @@ APP_PARENT_GROUPS = {
     "kerneldebugkit": "Apple Developer Tools",
     "sfsymbols": "Apple Developer Tools",
     "fonttoolsforxcode": "Apple Developer Tools",
+    "jdkjavadevelopmentkit": "Java",
+    "jrejavaruntimeenvironment": "Java",
 }
 
 
@@ -358,6 +371,42 @@ def apply_version_prefix_from_tail(raw_app: str, version: str) -> tuple[str, str
     return base, f"{label} {version}", f"version-prefix:{label}"
 
 
+JAVA_JDK_NAME = "JDK - Java Development Kit"
+JAVA_JRE_NAME = "JRE - Java Runtime Environment"
+JAVA_VERSION_U_RE = re.compile(r"^\d{1,3}u\d{1,4}(?:\.\d+)?$", re.IGNORECASE)
+JAVA_VERSION_NUMERIC_RE = re.compile(r"^\d{1,3}(?:\.\d+)*$")
+
+
+def normalize_java_distribution(app_name: str, version: str | None) -> tuple[str, str | None]:
+    """Normalize Java families into JDK/JRE canonical names.
+
+    Rules:
+    - explicit jdk/development kit keywords -> JDK family
+    - explicit jre/runtime env keywords -> JRE family
+    - plain "Java" with `XuY` version (e.g. 8u40) -> JRE family
+    """
+    key = app_key(app_name)
+    note: str | None = None
+    target = app_name
+
+    if any(token in key for token in ("jdk", "developmentkit")):
+        target = JAVA_JDK_NAME
+        note = "java-family:JDK"
+    elif any(token in key for token in ("jre", "runtimeenvironment", "runtimeenv")):
+        target = JAVA_JRE_NAME
+        note = "java-family:JRE"
+    elif key == "java" and version and JAVA_VERSION_U_RE.match(version):
+        target = JAVA_JRE_NAME
+        note = "java-family:JRE"
+    elif key == "java" and version and JAVA_VERSION_NUMERIC_RE.match(version):
+        major = int(version.split(".")[0])
+        if major >= 9:
+            target = JAVA_JDK_NAME
+            note = "java-family:JDK"
+
+    return target, note
+
+
 def extract_channel(raw: str) -> str | None:
     """Extract release channel/group tag from bracket or tail markers."""
     channel = None
@@ -428,6 +477,9 @@ def parse_name_and_version(
     app_name, version, version_note = apply_version_prefix_from_tail(app_name, version)
     if version_note:
         notes.append(version_note)
+    app_name, java_note = normalize_java_distribution(app_name, version)
+    if java_note:
+        notes.append(java_note)
     channel = extract_channel(normalized)
     if channel and publisher and app_key(channel) == app_key(publisher):
         channel = None
@@ -471,6 +523,9 @@ def parse_app_name_only(
         normalize_publishers=normalize_publishers,
         publishers=publishers,
     )
+    app_name, java_note = normalize_java_distribution(app_name, None)
+    if java_note:
+        notes.append(java_note)
     return ParseResult(
         app_name=app_name,
         version="",
